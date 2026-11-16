@@ -9,8 +9,13 @@
  *  - авторизація за логіном і паролем, ролі "адміністратор" і "користувач";
  *  - пароль не зберігається: у файл пишеться сіль і хеш SHA-256.
  *
- * Компіляція: gcc main.c -o survey
+ * Працює в Linux та Windows (у консолі Windows текст вводиться й виводиться
+ * в Юнікоді, тому українські літери показуються правильно).
+ *
+ * Компіляція в Linux:            gcc main.c -o survey
+ * Компіляція в Windows (MinGW):  gcc main.c -o survey.exe
  */
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,7 +23,10 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <wincrypt.h>
+#else
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -141,10 +149,19 @@ static void hash_password(const char *password, const char *salt, char out[HASH_
 static void make_salt(char out[SALT_LEN + 1])
 {
     uint8_t bytes[SALT_LEN / 2];
+    bool ok = false;
+#ifdef _WIN32
+    HCRYPTPROV provider;
+    if (CryptAcquireContextA(&provider, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        ok = CryptGenRandom(provider, (DWORD)sizeof bytes, bytes) != 0;
+        CryptReleaseContext(provider, 0);
+    }
+#else
     FILE *f = fopen("/dev/urandom", "rb");
-    bool ok = f != NULL && fread(bytes, 1, sizeof bytes, f) == sizeof bytes;
+    ok = f != NULL && fread(bytes, 1, sizeof bytes, f) == sizeof bytes;
     if (f != NULL)
         fclose(f);
+#endif
     if (!ok) {
         srand((unsigned)time(NULL) ^ (unsigned)clock());
         for (size_t i = 0; i < sizeof bytes; i++)
@@ -153,17 +170,96 @@ static void make_salt(char out[SALT_LEN + 1])
     to_hex(bytes, sizeof bytes, out);
 }
 
+/* --------------------------- Виведення тексту --------------------------- */
+
+/* Працює як printf. У консолі Windows виводить текст у Юнікоді,
+   бо звичайний printf показує там українські літери неправильно. */
+static void print(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+#ifdef _WIN32
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode;
+    if (GetConsoleMode(output, &mode)) {
+        char utf8[1024];
+        wchar_t wide[1024];
+        vsnprintf(utf8, sizeof utf8, format, args);
+        int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 1024);
+        if (n > 1) {
+            DWORD written;
+            fflush(stdout);
+            WriteConsoleW(output, wide, (DWORD)(n - 1), &written, NULL);
+        }
+        va_end(args);
+        return;
+    }
+#endif
+    vprintf(format, args);
+    va_end(args);
+}
+
 /* --------------------------- Введення даних --------------------------- */
 
-/* Читає рядок; якщо ввід закінчився - завершує програму. */
-static void read_raw(const char *prompt, char *buf, size_t size)
+/* Якщо рядок обрізано посеред багатобайтового символу UTF-8 - прибирає його залишок. */
+static void trim_partial_utf8(char *buf)
 {
-    printf("%s", prompt);
-    fflush(stdout);
-    if (fgets(buf, (int)size, stdin) == NULL) {
-        printf("\nВвід завершено. До побачення!\n");
-        exit(0);
+    size_t len = strlen(buf);
+    size_t i = len;
+    while (i > 0 && ((unsigned char)buf[i - 1] & 0xC0) == 0x80)
+        i--; /* пропускаємо байти-продовження */
+    if (i == 0)
+        return;
+    unsigned char lead = (unsigned char)buf[i - 1];
+    size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    if (len - (i - 1) < need)
+        buf[i - 1] = '\0';
+}
+
+/* Читає один рядок без символу нового рядка. Повертає false, якщо ввід закінчився. */
+static bool read_line(char *buf, size_t size)
+{
+#ifdef _WIN32
+    /* У консолі Windows читаємо текст у Юнікоді й перетворюємо на UTF-8:
+       звичайний fgets не вміє читати з консолі українські літери. */
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (GetConsoleMode(input, &mode)) {
+        wchar_t wide[512];
+        char utf8[2048];
+        size_t total = 0;
+        bool done = false;
+        while (!done) {
+            wchar_t chunk[128];
+            DWORD got = 0;
+            if (!ReadConsoleW(input, chunk, 128, &got, NULL) || got == 0) {
+                if (total == 0)
+                    return false;
+                break;
+            }
+            for (DWORD i = 0; i < got && !done; i++) {
+                if (chunk[i] == L'\n') {
+                    done = true;
+                } else if (chunk[i] == 0x1A) { /* Ctrl+Z - кінець вводу */
+                    if (total == 0)
+                        return false;
+                    done = true;
+                } else if (chunk[i] != L'\r' && total < 511) {
+                    wide[total++] = chunk[i];
+                }
+            }
+        }
+        wide[total] = L'\0';
+        if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, (int)sizeof utf8, NULL, NULL) <= 0)
+            utf8[0] = '\0';
+        strncpy(buf, utf8, size - 1);
+        buf[size - 1] = '\0';
+        trim_partial_utf8(buf);
+        return true;
     }
+#endif
+    if (fgets(buf, (int)size, stdin) == NULL)
+        return false;
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') {
         buf[len - 1] = '\0';
@@ -175,6 +271,19 @@ static void read_raw(const char *prompt, char *buf, size_t size)
     len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\r')
         buf[len - 1] = '\0';
+    trim_partial_utf8(buf);
+    return true;
+}
+
+/* Виводить запит і читає рядок; якщо ввід закінчився - завершує програму. */
+static void read_raw(const char *prompt, char *buf, size_t size)
+{
+    print("%s", prompt);
+    fflush(stdout);
+    if (!read_line(buf, size)) {
+        print("\nВвід завершено. До побачення!\n");
+        exit(0);
+    }
 }
 
 /* Читає непорожній рядок без ком (кома - роздільник у CSV). */
@@ -183,9 +292,9 @@ static void read_text(const char *prompt, char *buf, size_t size)
     for (;;) {
         read_raw(prompt, buf, size);
         if (buf[0] == '\0')
-            printf("  Поле не може бути порожнім.\n");
+            print("  Поле не може бути порожнім.\n");
         else if (strchr(buf, ',') != NULL)
-            printf("  Кома в цьому полі не дозволена.\n");
+            print("  Кома в цьому полі не дозволена.\n");
         else
             return;
     }
@@ -200,7 +309,7 @@ static int read_int(const char *prompt, int min, int max)
         long value = strtol(buf, &end, 10);
         if (buf[0] != '\0' && *end == '\0' && value >= min && value <= max)
             return (int)value;
-        printf("  Введіть ціле число від %d до %d.\n", min, max);
+        print("  Введіть ціле число від %d до %d.\n", min, max);
     }
 }
 
@@ -216,14 +325,25 @@ static bool read_bool(const char *prompt)
         if (buf[0] == 'n' || buf[0] == 'N' || buf[0] == '0' ||
             strncmp(buf, "н", 2) == 0 || strncmp(buf, "Н", 2) == 0)
             return false;
-        printf("  Дайте відповідь: т (так) або н (ні).\n");
+        print("  Дайте відповідь: т (так) або н (ні).\n");
     }
 }
 
 /* Читає пароль, не показуючи його на екрані. */
 static void read_password(const char *prompt, char *buf, size_t size)
 {
-#ifndef _WIN32
+#ifdef _WIN32
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD old_mode;
+    bool is_terminal = GetConsoleMode(input, &old_mode) != 0;
+    if (is_terminal)
+        SetConsoleMode(input, old_mode & ~(DWORD)ENABLE_ECHO_INPUT);
+    read_raw(prompt, buf, size);
+    if (is_terminal) {
+        SetConsoleMode(input, old_mode);
+        print("\n");
+    }
+#else
     struct termios old_settings, hidden;
     bool is_terminal = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &old_settings) == 0;
     if (is_terminal) {
@@ -234,10 +354,8 @@ static void read_password(const char *prompt, char *buf, size_t size)
     read_raw(prompt, buf, size);
     if (is_terminal) {
         tcsetattr(STDIN_FILENO, TCSANOW, &old_settings);
-        printf("\n");
+        print("\n");
     }
-#else
-    read_raw(prompt, buf, size);
 #endif
 }
 
@@ -248,7 +366,7 @@ static bool save_users(void)
 {
     FILE *f = fopen(DATA_FILE, "w");
     if (f == NULL) {
-        printf("Помилка: не вдалося записати файл %s.\n", DATA_FILE);
+        print("Помилка: не вдалося записати файл %s.\n", DATA_FILE);
         return false;
     }
     fprintf(f, "%s\n", CSV_HEADER);
@@ -277,7 +395,7 @@ static bool load_users(void)
         if (line_number == 1 || line[0] == '\0')
             continue; /* заголовок або порожній рядок */
         if (user_count >= MAX_USERS) {
-            printf("Увага: у файлі забагато записів, зайві пропущено.\n");
+            print("Увага: у файлі забагато записів, зайві пропущено.\n");
             break;
         }
         User u;
@@ -286,7 +404,7 @@ static bool load_users(void)
                             u.login, u.salt, u.hash, role, u.first_name, u.last_name,
                             &u.age, student);
         if (fields != 8) {
-            printf("Увага: рядок %d файлу пошкоджений і пропущений.\n", line_number);
+            print("Увага: рядок %d файлу пошкоджений і пропущений.\n", line_number);
             continue;
         }
         u.role = strcmp(role, "admin") == 0 ? ROLE_ADMIN : ROLE_USER;
@@ -311,19 +429,19 @@ static void print_padded(const char *text, int width)
     for (const char *p = text; *p != '\0'; p++)
         if (((unsigned char)*p & 0xC0) != 0x80)
             chars++;
-    printf("%s", text);
+    print("%s", text);
     for (int i = chars; i < width; i++)
-        putchar(' ');
+        print(" ");
 }
 
 static void print_user(const User *u)
 {
-    printf("  Логін:    %s\n", u->login);
-    printf("  Статус:   %s\n", role_name(u->role));
-    printf("  Ім'я:     %s\n", u->first_name);
-    printf("  Прізвище: %s\n", u->last_name);
-    printf("  Вік:      %d\n", u->age);
-    printf("  Студент:  %s\n", u->is_student ? "так" : "ні");
+    print("  Логін:    %s\n", u->login);
+    print("  Статус:   %s\n", role_name(u->role));
+    print("  Ім'я:     %s\n", u->first_name);
+    print("  Прізвище: %s\n", u->last_name);
+    print("  Вік:      %d\n", u->age);
+    print("  Студент:  %s\n", u->is_student ? "так" : "ні");
 }
 
 /* Виводить таблицю анкет. Якщо name_filter не NULL - лише з таким іменем. */
@@ -336,8 +454,8 @@ static void print_table(const char *name_filter)
     print_padded("Прізвище", 16);
     print_padded("Вік", 5);
     print_padded("Студент", 9);
-    printf("Статус\n");
-    printf("--------------------------------------------------------------------------\n");
+    print("Статус\n");
+    print("--------------------------------------------------------------------------\n");
     for (int i = 0; i < user_count; i++) {
         const User *u = &users[i];
         if (name_filter != NULL && strcmp(u->first_name, name_filter) != 0)
@@ -351,12 +469,12 @@ static void print_table(const char *name_filter)
         print_padded(u->last_name, 16);
         print_padded(age, 5);
         print_padded(u->is_student ? "так" : "ні", 9);
-        printf("%s\n", role_name(u->role));
+        print("%s\n", role_name(u->role));
     }
     if (shown == 0)
-        printf("(анкет не знайдено)\n");
+        print("(анкет не знайдено)\n");
     else
-        printf("Усього анкет: %d\n", shown);
+        print("Усього анкет: %d\n", shown);
 }
 
 /* ------------------------- Облікові записи ------------------------- */
@@ -391,7 +509,7 @@ static void fill_questionnaire(User *u)
 static User *create_account(Role role)
 {
     if (user_count >= MAX_USERS) {
-        printf("Неможливо додати: досягнуто максимуму записів.\n");
+        print("Неможливо додати: досягнуто максимуму записів.\n");
         return NULL;
     }
     User u;
@@ -402,20 +520,20 @@ static User *create_account(Role role)
         read_text("Логін: ", u.login, sizeof u.login);
         if (find_user(u.login) == NULL)
             break;
-        printf("  Такий логін уже зайнятий.\n");
+        print("  Такий логін уже зайнятий.\n");
     }
 
     char password[STR_LEN], repeat[STR_LEN];
     for (;;) {
         read_password("Пароль (не менше 4 символів): ", password, sizeof password);
         if (strlen(password) < 4) {
-            printf("  Пароль закороткий.\n");
+            print("  Пароль закороткий.\n");
             continue;
         }
         read_password("Повторіть пароль: ", repeat, sizeof repeat);
         if (strcmp(password, repeat) == 0)
             break;
-        printf("  Паролі не збігаються.\n");
+        print("  Паролі не збігаються.\n");
     }
     make_salt(u.salt);
     hash_password(password, u.salt, u.hash);
@@ -429,7 +547,7 @@ static User *create_account(Role role)
         user_count--;
         return NULL;
     }
-    printf("\nДані збережено у файл %s:\n", DATA_FILE);
+    print("\nДані збережено у файл %s:\n", DATA_FILE);
     print_user(&users[user_count - 1]);
     return &users[user_count - 1];
 }
@@ -449,10 +567,10 @@ static User *log_in(void)
     }
     memset(password, 0, sizeof password);
     if (!ok) {
-        printf("Неправильний логін або пароль.\n");
+        print("Неправильний логін або пароль.\n");
         return NULL;
     }
-    printf("Вітаємо, %s %s! Ваш статус: %s.\n", u->first_name, u->last_name, role_name(u->role));
+    print("Вітаємо, %s %s! Ваш статус: %s.\n", u->first_name, u->last_name, role_name(u->role));
     return u;
 }
 
@@ -461,13 +579,13 @@ static User *log_in(void)
 static void user_menu(const User *current)
 {
     for (;;) {
-        printf("\n--- Меню користувача (%s) ---\n", current->login);
-        printf("1. Переглянути свої дані\n");
-        printf("0. Вийти з облікового запису\n");
+        print("\n--- Меню користувача (%s) ---\n", current->login);
+        print("1. Переглянути свої дані\n");
+        print("0. Вийти з облікового запису\n");
         int choice = read_int("Ваш вибір: ", 0, 1);
         if (choice == 0)
             return;
-        printf("\nВаші дані:\n");
+        print("\nВаші дані:\n");
         print_user(current);
     }
 }
@@ -475,18 +593,18 @@ static void user_menu(const User *current)
 static void admin_menu(const char *current_login)
 {
     for (;;) {
-        printf("\n--- Меню адміністратора (%s) ---\n", current_login);
-        printf("1. Створити нового користувача\n");
-        printf("2. Переглянути всі анкети\n");
-        printf("3. Знайти анкети за ім'ям\n");
-        printf("4. Переглянути свої дані\n");
-        printf("0. Вийти з облікового запису\n");
+        print("\n--- Меню адміністратора (%s) ---\n", current_login);
+        print("1. Створити нового користувача\n");
+        print("2. Переглянути всі анкети\n");
+        print("3. Знайти анкети за ім'ям\n");
+        print("4. Переглянути свої дані\n");
+        print("0. Вийти з облікового запису\n");
         int choice = read_int("Ваш вибір: ", 0, 4);
-        printf("\n");
+        print("\n");
         if (choice == 0) {
             return;
         } else if (choice == 1) {
-            printf("Статус нового запису: 1 - користувач, 2 - адміністратор\n");
+            print("Статус нового запису: 1 - користувач, 2 - адміністратор\n");
             Role role = read_int("Ваш вибір: ", 1, 2) == 2 ? ROLE_ADMIN : ROLE_USER;
             create_account(role);
         } else if (choice == 2) {
@@ -499,7 +617,7 @@ static void admin_menu(const char *current_login)
             /* масив users міг змінитися, тому шукаємо запис заново */
             const User *me = find_user(current_login);
             if (me != NULL) {
-                printf("Ваші дані:\n");
+                print("Ваші дані:\n");
                 print_user(me);
             }
         }
@@ -508,31 +626,31 @@ static void admin_menu(const char *current_login)
 
 int main(void)
 {
-    printf("=== Програма анкетування ===\n");
+    print("=== Програма анкетування ===\n");
 
     if (load_users()) {
-        printf("Файл %s прочитано, записів: %d.\n", DATA_FILE, user_count);
+        print("Файл %s прочитано, записів: %d.\n", DATA_FILE, user_count);
     } else {
-        printf("Файл %s не знайдено. Створюю новий файл.\n", DATA_FILE);
+        print("Файл %s не знайдено. Створюю новий файл.\n", DATA_FILE);
         if (!save_users())
             return 1;
     }
 
     if (count_admins() == 0) {
-        printf("\nУ системі ще немає адміністратора. Створіть його обліковий запис.\n");
+        print("\nУ системі ще немає адміністратора. Створіть його обліковий запис.\n");
         if (create_account(ROLE_ADMIN) == NULL)
             return 1;
     }
 
     for (;;) {
-        printf("\n--- Головне меню ---\n");
-        printf("1. Вхід\n");
-        printf("2. Реєстрація\n");
-        printf("0. Вихід із програми\n");
+        print("\n--- Головне меню ---\n");
+        print("1. Вхід\n");
+        print("2. Реєстрація\n");
+        print("0. Вихід із програми\n");
         int choice = read_int("Ваш вибір: ", 0, 2);
-        printf("\n");
+        print("\n");
         if (choice == 0) {
-            printf("До побачення!\n");
+            print("До побачення!\n");
             return 0;
         } else if (choice == 1) {
             User *u = log_in();
@@ -546,7 +664,7 @@ int main(void)
                 user_menu(u);
             }
         } else {
-            printf("Реєстрація нового користувача. Заповніть анкету.\n");
+            print("Реєстрація нового користувача. Заповніть анкету.\n");
             create_account(ROLE_USER);
         }
     }
